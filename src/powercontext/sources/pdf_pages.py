@@ -138,7 +138,17 @@ async def search_pdf_pages(
     hits = await _search_candidates(memory, plan, limit=limit)
     if not hits:
         return ()
-    ranked = _rank(_page_candidates(hits, plan), plan, limit=limit)
+    candidates = _page_candidates(hits, plan)
+    document = _target_document(candidates, plan)
+    if document is not None:
+        if len({candidate.document for candidate in candidates}) > 1:
+            # The scope holds several documents and the query words are shared, so the first
+            # pass can crowd the named document out of the candidate lists. Naming it in the
+            # queries makes the second pass return that document's pages.
+            hits = await _search_candidates(memory, plan, limit=limit, document=document)
+            candidates = _page_candidates(hits, plan)
+        candidates = [candidate for candidate in candidates if candidate.document == document]
+    ranked = _rank(candidates, plan, document=document, limit=limit)
     return await _citations(memory, ranked, limit=limit)
 
 
@@ -409,7 +419,9 @@ _IDF_FLOOR: Final = 1e-6
 class _QueryPlan:
     """The searches to run for one question and the weights used to rank their results."""
 
+    terms: tuple[str, ...]
     facets: tuple[str, ...]
+    probes: tuple[str, ...]
     weights: dict[str, float]
     wants_reported_numbers: bool
 
@@ -422,6 +434,7 @@ class _PageCandidate:
     counts: Counter[str]
     length: int
     statement: int | None
+    document: str | None
 
 
 # --- retrieval -------------------------------------------------------------------------
@@ -432,15 +445,21 @@ async def _search_candidates(
     plan: _QueryPlan,
     *,
     limit: int,
+    document: str | None = None,
 ) -> list[MemoryHit]:
     """Run every planned query and keep the union of the returned entry versions."""
 
     from powercontext.builtin.runtime import SearchMemoryRequest
 
-    pool = max(limit * 3, 60)
+    pool = max(limit * 10, 200) if document is not None else max(limit * 3, 60)
     hits: list[MemoryHit] = []
     seen: set[tuple[str, int, str, str]] = set()
-    for facet in plan.facets:
+    facets = plan.facets + plan.probes
+    if document is not None:
+        token = _document_token(document)
+        if token:
+            facets = tuple(f"{facet} {token}" for facet in facets)
+    for facet in facets:
         page = await memory.search(SearchMemoryRequest(query=facet, mode="fts", limit=pool))
         for hit in page.hits:
             key = (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry_id, hit.entry_version_id)
@@ -449,6 +468,13 @@ async def _search_candidates(
             seen.add(key)
             hits.append(hit)
     return hits
+
+
+def _document_token(document: str) -> str:
+    """Return the leading word of a document id, which names the report in its own pages."""
+
+    head = document.split("_", 1)[0].strip()
+    return head if _tokenize(head) else ""
 
 
 def _page_candidates(hits: Iterable[MemoryHit], plan: _QueryPlan) -> list[_PageCandidate]:
@@ -462,12 +488,50 @@ def _page_candidates(hits: Iterable[MemoryHit], plan: _QueryPlan) -> list[_PageC
                 counts=Counter(tokens),
                 length=len(tokens),
                 statement=_statement_priority(body) if plan.wants_reported_numbers else None,
+                document=_leading_line(hit.text),
             ),
         )
     return candidates
 
 
-def _rank(candidates: Sequence[_PageCandidate], plan: _QueryPlan, *, limit: int) -> list[_PageCandidate]:
+def _target_document(candidates: Sequence[_PageCandidate], plan: _QueryPlan) -> str | None:
+    """Return the document the question names, when the candidates make that unambiguous.
+
+    The standard projection prefixes a page with its document id, so the leading line of a
+    candidate is that id. A scope may hold several documents; a question that names one of
+    them should be answered from that document alone, otherwise pages of a sibling document
+    can take the slots of the pages the question is about.
+    """
+
+    labels = Counter(candidate.document for candidate in candidates if candidate.document)
+    if not labels:
+        return None
+    if len(labels) == 1:
+        return next(iter(labels))
+    tokens = {label: set(_tokenize(label)) for label in labels}
+    frequency: Counter[str] = Counter()
+    for label_tokens in tokens.values():
+        frequency.update(label_tokens)
+    terms = set(plan.terms)
+    joined = {"".join(pair) for pair in zip(plan.terms, plan.terms[1:], strict=False)}
+    scores: dict[str, float] = {}
+    for label, label_tokens in tokens.items():
+        scores[label] = sum(1.0 / frequency[token] for token in (label_tokens & terms) | (label_tokens & joined))
+    best, runner_up = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:2]
+    # Only a token that appears in this document id alone proves which document is meant; a
+    # shared token such as a fiscal year must not decide it.
+    if best[1] < 1.0 or runner_up[1] >= best[1]:
+        return None
+    return best[0]
+
+
+def _rank(
+    candidates: Sequence[_PageCandidate],
+    plan: _QueryPlan,
+    *,
+    document: str | None,
+    limit: int,
+) -> list[_PageCandidate]:
     """Order candidate pages by term evidence, with the statements of a numeric report first."""
 
     if not candidates:
@@ -495,7 +559,7 @@ def _rank(candidates: Sequence[_PageCandidate], plan: _QueryPlan, *, limit: int)
         statements: list[tuple[int, int]] = []
         for position, candidate in enumerate(candidates):
             priority = candidate.statement
-            if priority is not None:
+            if priority is not None and (document is None or candidate.document == document):
                 statements.append((priority, position))
         statements.sort()
         # A statement anchor is a strong lead, not a replacement for the caller's budget.
@@ -534,7 +598,9 @@ async def _citations(
         keys = [
             key for key in (_page_key(reference.source_id) for reference in record.entry.sources) if key is not None
         ]
-        if not keys or used.intersection(keys):
+        # A citation names one exact page; an entry that aggregates several pages cannot be
+        # returned as a page citation, and a repeated page would not be a new one.
+        if len(keys) != 1 or used.intersection(keys):
             continue
         used.update(keys)
         citations.append(record.citation)
@@ -564,10 +630,11 @@ def _plan_queries(question: str) -> _QueryPlan:
     for expansion in concepts[:_CONCEPT_FACETS]:
         facets.append(" ".join(expansion[: _FACET_TERMS + 2]))
     wants_reported_numbers = len(set(terms) & _REPORTED_NUMBER_TERMS) >= 2
-    if wants_reported_numbers:
-        facets.extend(_STATEMENT_PROBES)
+    probes = _STATEMENT_PROBES if wants_reported_numbers else ()
     return _QueryPlan(
+        terms=tuple(terms),
         facets=tuple(dict.fromkeys(facet for facet in facets if facet.strip())),
+        probes=probes,
         weights=weights,
         wants_reported_numbers=wants_reported_numbers,
     )
@@ -622,8 +689,15 @@ def _is_prefix(left: str, right: str) -> bool:
     return left.startswith(right) or right.startswith(left)
 
 
+def _leading_line(text: str) -> str | None:
+    """Return the document id the standard projection puts in front of a page, if any."""
+
+    head = text.split("\n", 1)[0].strip()
+    return head or None
+
+
 def _page_body(text: str) -> str:
-    """Drop the document id line the standard projection puts in front of the page text."""
+    """Return the page text without the document id line the standard projection adds."""
 
     return text.split("\n", 1)[1] if "\n" in text else text
 
