@@ -253,10 +253,7 @@ def _chunks(items: Iterable[bytes], /) -> tuple[bytes, ...]:
         for item in items:
             if not isinstance(item, (bytes, bytearray, memoryview)):
                 raise ContextPackError("each chunk must be bytes")  # noqa: TRY003
-            chunk = bytes(item)
-            if not chunk:
-                raise ContextPackError("pack chunks must not be empty")  # noqa: TRY003
-            chunks.append(chunk)
+            chunks.append(bytes(item))
     except TypeError as error:
         raise ContextPackError(f"chunks must be iterable: {error}") from error  # noqa: TRY003
     for position, chunk in enumerate(chunks):
@@ -285,8 +282,7 @@ def _decode_items(value: object, field: str) -> tuple[bytes, ...]:
         if _encode_item(decoded) != item:
             raise ContextPackError(f"{field}[{position}] is not canonical Base64")  # noqa: TRY003
         items.append(decoded)
-    chunks = _chunks(items)
-    return chunks
+    return _chunks(items)
 
 
 def _pack_digest(items: tuple[bytes, ...]) -> str:
