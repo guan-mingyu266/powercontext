@@ -85,6 +85,7 @@ from powercontext.builtin.persistence.memory_index import CompositeMemoryIndex, 
 from powercontext.builtin.persistence.oceanbase.experience_index import OceanBaseExperienceFTSIndex
 from powercontext.builtin.persistence.oceanbase.memory_index import (
     OceanBaseMemoryFTSIndex,
+    OceanBaseMemoryHybridIndex,
     OceanBaseMemoryVectorIndex,
 )
 from powercontext.builtin.persistence.oceanbase.profile import OceanBaseConfig, OceanBaseProfile
@@ -720,6 +721,10 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
         "profile": config.runtime.profile_schedule_enabled or None,
         "skill": None,
     }
+    count_thresholds = {
+        "memory": config.runtime.memory_source_count_threshold,
+        "topic-memory": config.runtime.topic_memory_source_count_threshold,
+    }
     for family, schedule in automatic.items():
         if schedule is not None and family not in declared | registered:
             if (
@@ -788,6 +793,7 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 if family == "skill"
                 else SourceProcessingPendingProvider(contexts.database, binding, family),
                 automatic_scope_filter=enabled_profile_scopes if family == "profile" else None,
+                source_count_threshold=count_thresholds.get(family),
             )
         )
     _validate_processing_registrations(configured)
@@ -818,6 +824,21 @@ def _topic_memory_provider_available(config: BuiltinConfig) -> bool:
     except BuiltinConfigurationError:
         return False
     return True
+
+
+def _open_memory_indexes(*, seekdb: bool, embedding_model: EmbeddingModel | None) -> list[MemoryIndex]:
+    """Choose the Memory candidate projection for the selected relational backend.
+
+    seekdb evaluates both candidate channels in one native statement, so hybrid
+    queries never reach the backend-neutral composite as two separate queries.
+    """
+
+    if seekdb and embedding_model is not None:
+        return [OceanBaseMemoryHybridIndex(embedding_model.profile)]
+    indexes: list[MemoryIndex] = [OceanBaseMemoryFTSIndex()]
+    if embedding_model is not None:
+        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
+    return indexes
 
 
 @asynccontextmanager
@@ -961,10 +982,12 @@ async def open_builtin_contexts(
                 await contexts.aclose_usage_recorder()
         return
     experience_index = OceanBaseExperienceFTSIndex()
-    indexes = [OceanBaseMemoryFTSIndex()]
-    if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-    index = CompositeMemoryIndex(*indexes)
+    index = CompositeMemoryIndex(
+        *_open_memory_indexes(
+            seekdb=isinstance(database, SeekDBConfig),
+            embedding_model=embedding_model,
+        )
+    )
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))

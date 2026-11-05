@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -80,6 +85,10 @@ _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
+# Journal-identity counting polls the persisted head and cursor, so it needs no
+# capture hook: a wake interval bounded by the test's quiet window is enough.
+_COUNT_DISCOVERY_DELAY_SECONDS = 0.2
+_COUNT_DISCOVERY_SCOPE_LIMIT = 500
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 ProcessingKey = tuple[str, str]
@@ -117,8 +126,11 @@ class ArtifactProcessingBinding:
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
+    # Accept one ordinary processing call once this many new journal identities
+    # are waiting behind the Family cursor. ``None`` keeps the time-only policy.
+    source_count_threshold: int | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 - one validation per declared field
         if not self.binding_name or self.binding_name != self.binding_name.strip():
             raise ValueError("binding_name must be nonempty and trimmed")  # noqa: TRY003
         if re.fullmatch(r"[a-z][a-z0-9-]*", self.artifact_family) is None:
@@ -138,6 +150,10 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int or self.source_count_threshold < 1
+        ):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -404,6 +420,9 @@ class _FamilyState:
     automatic_next: bool = False
     overflow_not_before: float = 0.0
     degraded: bool = False
+    # Scopes whose Topic Memory wave was accepted by the count channel and is
+    # still draining; Memory re-checks its threshold after every window instead.
+    count_wave: set[str] = field(default_factory=set)
     completed: int = 0
     failed: int = 0
     timeouts: int = 0
@@ -648,6 +667,7 @@ class ArtifactProcessingSupervisor:
                 state.next_discovery_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
         else:
             state.reconcile_complete = True
+        await self._discover_count(state)
         # Alternate discovery channels so explicit traffic cannot monopolize admission.
         state.automatic_next = not state.automatic_next
         if state.automatic_next:
@@ -781,6 +801,61 @@ class ArtifactProcessingSupervisor:
         state.next_discovery_at = next_discovery_at
         for scope in admitted:
             self._enqueue(state, scope)
+
+    async def _discover_count(self, state: _FamilyState) -> None:
+        """Accept one ordinary call when enough journal identities wait behind the cursor.
+
+        The count is derived from the persisted journal head and the Family cursor, so
+        duplicate captures, receipt trust upgrades and restarts all resolve the same way:
+        only identities not yet consumed count, and nothing is recounted after success.
+        """
+
+        binding = state.binding
+        threshold = binding.source_count_threshold
+        if threshold is None:
+            return
+        loop = asyncio.get_running_loop()
+        state.next_discovery_at = loop.time() + _COUNT_DISCOVERY_DELAY_SECONDS
+        requested = False
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            heads = (
+                await connection.execute(
+                    select(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id, SOURCE_JOURNAL_HEADS_TABLE.c.position)
+                    .order_by(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id)
+                    .limit(_COUNT_DISCOVERY_SCOPE_LIMIT)
+                )
+            ).all()
+            cursors = SourceCursorRepository()
+            for scope_id, position in heads:
+                scope = str(scope_id)
+                cursor = await cursors.load(connection, scope, binding.binding_name)
+                pending = int(position) - (0 if cursor is None else cursor.cursor.sequence)
+                if pending <= 0:
+                    state.count_wave.discard(scope)
+                    continue
+                if not self._count_reached(state, scope, pending, threshold):
+                    continue
+                intent = await self._intents.load(connection, scope, binding.binding_name, for_update=True)
+                if intent is not None and intent.requested_generation > intent.handled_generation:
+                    continue
+                await self._intents.request(connection, scope, binding.binding_name)
+                requested = True
+        if requested:
+            state.discovery_pending = True
+
+    @staticmethod
+    def _count_reached(state: _FamilyState, scope: str, pending: int, threshold: int) -> bool:
+        """Decide whether the outstanding identities justify one more accepted call."""
+
+        if state.binding.artifact_family == "topic-memory":
+            if pending >= threshold:
+                state.count_wave.add(scope)
+                return True
+            # An accepted Topic Memory wave drains its remaining windows without
+            # re-applying the threshold; Memory re-checks the count after each window.
+            return scope in state.count_wave
+        return pending >= threshold
 
     @staticmethod
     def _fresh_capacity(state: _FamilyState) -> int:
@@ -1093,7 +1168,13 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
-            if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
+            if (
+                state.discovery_pending
+                or state.scan_in_progress
+                or not state.reconcile_complete
+                or state.degraded
+                or state.binding.source_count_threshold is not None
+            ):
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
 
